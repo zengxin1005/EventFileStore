@@ -31,7 +31,7 @@ namespace ET.DrSdk
         private const string INDEX_FILE = "events.idx";
         private const string SEGMENT_PREFIX = "event_";
         private const string SEGMENT_EXT = ".dat";
-        private const int WRITE_BUFFER_SIZE = 512 * 1024;   
+        private const int BUFFER_SIZE = 512 * 1024;   
         private const int MAX_EVENTID_LENGTH = 1024;
         private const int SEGMENTSIZE = 10 * 1024 * 1024;
         private DRSDKConfig _config;
@@ -55,7 +55,6 @@ namespace ET.DrSdk
                 Directory.CreateDirectory(_storePath);
             
             LoadIndex();
-            EnsureActiveSegmentWriter();
             
             _config.Log($"初始化完成: 事件数={_index.Count}, 当前segment={_currentSegmentId}");
         }
@@ -306,7 +305,7 @@ namespace ET.DrSdk
             try
             {
                 var indexFile = Path.Combine(_storePath, INDEX_FILE);
-                using (var fs = new FileStream(indexFile, FileMode.Create, FileAccess.Write, FileShare.None, WRITE_BUFFER_SIZE, 
+                using (var fs = new FileStream(indexFile, FileMode.Create, FileAccess.Write, FileShare.ReadWrite, BUFFER_SIZE, 
                            FileOptions.SequentialScan))
                 using (var writer = new BinaryWriter(fs, Encoding.UTF8, true))
                 {
@@ -352,7 +351,7 @@ namespace ET.DrSdk
                 var filePath = GetSegmentFilePath(_currentSegmentId);
                 
                 _activeStream = new FileStream(filePath, FileMode.OpenOrCreate, 
-                    FileAccess.ReadWrite, FileShare.Read, WRITE_BUFFER_SIZE,
+                    FileAccess.Write, FileShare.ReadWrite, BUFFER_SIZE,
                     FileOptions.SequentialScan);
                 
                 _activeWriter = new BinaryWriter(_activeStream, Encoding.UTF8, true);
@@ -378,7 +377,7 @@ namespace ET.DrSdk
             
             var filePath = GetSegmentFilePath(_currentSegmentId);
             _activeStream = new FileStream(filePath, FileMode.Create, 
-                FileAccess.ReadWrite, FileShare.Read, WRITE_BUFFER_SIZE,
+                FileAccess.Write, FileShare.ReadWrite, BUFFER_SIZE,
                 FileOptions.SequentialScan);
             
             _activeWriter = new BinaryWriter(_activeStream, Encoding.UTF8, true);
@@ -396,7 +395,7 @@ namespace ET.DrSdk
             
             try
             {
-                using var fs = new FileStream(indexFile, FileMode.Open, FileAccess.Read, FileShare.Read);
+                using var fs = new FileStream(indexFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,BUFFER_SIZE,FileOptions.SequentialScan);
                 using var reader = new BinaryReader(fs, Encoding.UTF8, true);
                 
                 var count = reader.ReadInt32();
@@ -493,7 +492,7 @@ namespace ET.DrSdk
             {
                 var activeSegmentIds = _index.Values.Select(idx => idx.SegmentId).Distinct().ToHashSet();
         
-                foreach (var file in Directory.EnumerateFiles(_storePath, $"{SEGMENT_PREFIX}*{SEGMENT_EXT}"))
+                foreach (var file in Directory.GetFiles(_storePath, $"{SEGMENT_PREFIX}*{SEGMENT_EXT}"))
                 {
                     var segmentId = ParseSegmentId(file);
                     if (segmentId == _currentSegmentId)
@@ -518,6 +517,101 @@ namespace ET.DrSdk
             var fileName = Path.GetFileNameWithoutExtension(filePath);
             var idStr = fileName.Replace(SEGMENT_PREFIX, "");
             return int.Parse(idStr);
+        }
+        
+        
+        /// <summary>
+        /// 从所有 segment 文件重建索引
+        /// </summary>
+        public void RebuildIndexFromSegments()
+        {
+            var newIndex = new Dictionary<string, EventIndex>();
+            var segmentFiles = Directory.GetFiles(_storePath, $"{SEGMENT_PREFIX}*{SEGMENT_EXT}")
+                .OrderBy(f => f)  // 按文件名排序
+                .ToList();
+            
+            foreach (var segmentFile in segmentFiles)
+            {
+                var segmentId = ParseSegmentId(segmentFile);
+                
+                using var fs = new FileStream(segmentFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var reader = new BinaryReader(fs, Encoding.UTF8, true);
+                
+                long offset = 0;
+                while (offset < fs.Length)
+                {
+                    fs.Seek(offset, SeekOrigin.Begin);
+                    
+                    try
+                    {
+                        // 读取魔数
+                        if (reader.ReadUInt32() != FILE_MAGIC)
+                        {
+                            _config.Log($"魔数不匹配，跳过偏移 {offset}");
+                            offset += 4;
+                            continue;
+                        }
+                        
+                        // 读取事件ID长度和内容
+                        var eventIdLength = reader.ReadInt32();
+                        if (eventIdLength <= 0 || eventIdLength > MAX_EVENTID_LENGTH)
+                        {
+                            offset += 4 + 4 + eventIdLength + 4 + 4;
+                            continue;
+                        }
+                        
+                        var eventIdBytes = reader.ReadBytes(eventIdLength);
+                        var eventId = Encoding.UTF8.GetString(eventIdBytes);
+                        
+                        // 读取数据长度
+                        var dataLength = reader.ReadInt32();
+                        if (dataLength <= 0 || dataLength > SEGMENTSIZE)
+                        {
+                            offset += 4 + 4 + eventIdLength + 4 + 4 + dataLength + 4;
+                            continue;
+                        }
+                        
+                        // 读取数据
+                        var data = reader.ReadBytes(dataLength);
+                        
+                        // 读取 CRC
+                        var crc32 = reader.ReadUInt32();
+                        
+                        // 计算总大小
+                        var totalSize = 4 + 4 + eventIdLength + 4 + dataLength + 4;
+                        
+                        newIndex[eventId] = new EventIndex
+                        {
+                            SegmentId = segmentId,
+                            FileOffset = offset,
+                            DataLength = dataLength,
+                            Crc32 = crc32
+                        };
+                        
+                        offset += totalSize;
+                    }
+                    catch (EndOfStreamException)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        _config.Log($"读取事件失败: {ex.Message}");
+                        offset += 4;  // 跳过损坏部分
+                    }
+                }
+            }
+            
+            // 替换索引
+            _index.Clear();
+            foreach (var kvp in newIndex)
+            {
+                _index[kvp.Key] = kvp.Value;
+            }
+            
+            // 保存重建后的索引
+            SaveIndex();
+            _config.Log($"索引重建完成，共 {_index.Count} 个事件");
         }
         
         #endregion
